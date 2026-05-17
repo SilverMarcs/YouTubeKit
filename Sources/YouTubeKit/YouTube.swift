@@ -307,14 +307,40 @@ public class YouTube {
     /// If the streams have not been initialized, finds all relevant streams and initializes them.
     public var streams: [Stream] {
         get async throws {
-            if !skipAvailabilityCheck {
-                try await checkAvailability()
+            do {
+                return try await extractStreams()
+            } catch {
+                // Any failure with the warm path engaged probably means the persisted
+                // ytcfg / js / signatureTimestamp went stale (YouTube rotates them).
+                // Wipe everything and retry once on the cold path before giving up.
+                guard skipAvailabilityCheck else { throw error }
+                print("YouTubeKit warm-path extraction failed (\(error)); invalidating caches and retrying cold")
+                _watchHTML = nil
+                _embedHTML = nil
+                _js = nil
+                _jsURL = nil
+                _ytcfg = nil
+                _signatureTimestamp = nil
+                _videoInfos = nil
+                _ageRestricted = nil
+                _fmtStreams = nil
+                YouTube.invalidateAllCaches()
+                skipAvailabilityCheck = false
+                defer { skipAvailabilityCheck = true }
+                return try await extractStreams()
             }
-            if let cached = _fmtStreams {
-                return cached
-            }
-            
-            let result = try await Task.retry(with: methods) { method in
+        }
+    }
+
+    private func extractStreams() async throws -> [Stream] {
+        if !skipAvailabilityCheck {
+            try await checkAvailability()
+        }
+        if let cached = _fmtStreams {
+            return cached
+        }
+
+        let result = try await Task.retry(with: methods) { method in
                 switch method {
 #if canImport(JavaScriptCore)
                 case .local:
@@ -389,12 +415,11 @@ public class YouTube {
                     return remoteStreams.compactMap { try? Stream(remoteStream: $0) }
                 }
             }
-            
+
             _fmtStreams = result
             return result
-        }
     }
-    
+
     /// Returns a list of live streams - currently only HLS supported
     /// - Note: Currently doesn't respect `method` set. It always uses `.local`
     public var livestreams: [Livestream] {
