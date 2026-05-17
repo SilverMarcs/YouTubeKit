@@ -119,6 +119,13 @@ public class YouTube {
     /// per-video cost. Set this before reading `streams`.
     public var itagFilter: (@Sendable (Int) -> Bool)?
 
+    /// Optional check used during sequential InnerTube extraction. Receives
+    /// the itag set of each client's response; return `true` to stop trying
+    /// further clients. When unset, the first successful client wins.
+    /// Use to early-out as soon as a client returns the format you need
+    /// (e.g. `{ $0.contains(137) }` for 1080p AVC1).
+    public var responseSatisfied: (@Sendable ([Int]) -> Bool)?
+
     private let log = OSLog(YouTube.self)
     
     /// - parameter methods: Methods used to extract streams from the video - ordered by priority (Default: `local` on iOS, macOS, tvOS, visionOS; `remote` on watchOS)
@@ -443,30 +450,33 @@ public class YouTube {
             let signatureTimestamp = try await signatureTimestamp
             let ytcfg = try await ytcfg
             
-            // Kept all three clients (parallel) for full format coverage.
-            // Dropping to a single client misses 1080p AVC1 on some videos —
-            // the latency win wasn't worth the quality regression.
-            let innertubeClients: [InnerTube.ClientType] = [.androidVR, .webSafari, .web]
-            
-            let results: [Result<InnerTube.VideoInfo, Error>] = await innertubeClients.concurrentMap { [videoID, useOAuth, allowOAuthCache] client in
-                let innertube = InnerTube(client: client, signatureTimestamp: signatureTimestamp, ytcfg: ytcfg, useOAuth: useOAuth, allowCache: allowOAuthCache)
-                
-                do {
-                    let innertubeResponse = try await innertube.player(videoID: videoID)
-                    return .success(innertubeResponse)
-                } catch let error {
-                    return .failure(error)
-                }
-            }
-            
+            // Sequential client fallback. Try androidVR first (typically returns the
+            // full AVC1 set in one call). Only fall through to web / webSafari if the
+            // caller's `responseSatisfied` check rejects the response.
+            //
+            // Without `responseSatisfied` set, the first successful client wins —
+            // matches the old "happy path" but pays only 1 round-trip on cache-warm runs.
+            let clientPriority: [InnerTube.ClientType] = [.androidVR, .web, .webSafari]
+
             var videoInfos = [InnerTube.VideoInfo]()
             var errors = [Error]()
-            
-            for result in results {
-                switch result {
-                case .success(let innertubeResponse):
-                    videoInfos.append(innertubeResponse)
-                case .failure(let error):
+
+            for client in clientPriority {
+                let innertube = InnerTube(client: client, signatureTimestamp: signatureTimestamp, ytcfg: ytcfg, useOAuth: useOAuth, allowCache: allowOAuthCache)
+                do {
+                    let response = try await innertube.player(videoID: videoID)
+                    videoInfos.append(response)
+
+                    // Stop as soon as we get a response the caller considers sufficient.
+                    let adaptiveItags = response.streamingData?.adaptiveFormats?.map(\.itag) ?? []
+                    let muxedItags = response.streamingData?.formats?.map(\.itag) ?? []
+                    let allItags = adaptiveItags + muxedItags
+                    if let check = self.responseSatisfied {
+                        if check(allItags) { break }
+                    } else {
+                        break
+                    }
+                } catch {
                     errors.append(error)
                 }
             }
