@@ -490,9 +490,18 @@ public class YouTube {
                 let innertube = InnerTube(client: client, signatureTimestamp: signatureTimestamp, ytcfg: ytcfg, useOAuth: useOAuth, allowCache: allowOAuthCache)
                 do {
                     let response = try await innertube.player(videoID: videoID)
+
+                    // InnerTube clients occasionally return a player response for a
+                    // different videoID (ytcfg/cookie drift). Skip without breaking
+                    // so we try the next client instead of accepting a bogus response.
+                    guard response.videoDetails?.videoId == videoID else {
+                        os_log("Skipping wrong-video response from %{public}@", log: log, type: .info, client.rawValue)
+                        continue
+                    }
+
                     videoInfos.append(response)
 
-                    // Stop as soon as we get a response the caller considers sufficient.
+                    // Stop as soon as we get a valid response the caller considers sufficient.
                     let adaptiveItags = response.streamingData?.adaptiveFormats?.map(\.itag) ?? []
                     let muxedItags = response.streamingData?.formats?.map(\.itag) ?? []
                     let allItags = adaptiveItags + muxedItags
