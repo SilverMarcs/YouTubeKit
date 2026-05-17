@@ -486,31 +486,29 @@ public class YouTube {
             var videoInfos = [InnerTube.VideoInfo]()
             var errors = [Error]()
 
-            for client in clientPriority {
+            // Fire all clients in parallel. Sequential cascade turned out to be
+            // unreliable in some YouTube states — we need the union of responses
+            // because individual clients can return placeholder/wrong-video data.
+            let results: [Result<InnerTube.VideoInfo, Error>] = await clientPriority.concurrentMap { [videoID, useOAuth, allowOAuthCache] client in
                 let innertube = InnerTube(client: client, signatureTimestamp: signatureTimestamp, ytcfg: ytcfg, useOAuth: useOAuth, allowCache: allowOAuthCache)
                 do {
-                    let response = try await innertube.player(videoID: videoID)
-
-                    // InnerTube clients occasionally return a player response for a
-                    // different videoID (ytcfg/cookie drift). Skip without breaking
-                    // so we try the next client instead of accepting a bogus response.
-                    guard response.videoDetails?.videoId == videoID else {
-                        os_log("Skipping wrong-video response from %{public}@", log: log, type: .info, client.rawValue)
-                        continue
-                    }
-
-                    videoInfos.append(response)
-
-                    // Stop as soon as we get a valid response the caller considers sufficient.
-                    let adaptiveItags = response.streamingData?.adaptiveFormats?.map(\.itag) ?? []
-                    let muxedItags = response.streamingData?.formats?.map(\.itag) ?? []
-                    let allItags = adaptiveItags + muxedItags
-                    if let check = self.responseSatisfied {
-                        if check(allItags) { break }
-                    } else {
-                        break
-                    }
+                    return .success(try await innertube.player(videoID: videoID))
                 } catch {
+                    return .failure(error)
+                }
+            }
+
+            for (client, result) in zip(clientPriority, results) {
+                switch result {
+                case .success(let response):
+                    let returnedID = response.videoDetails?.videoId ?? "nil"
+                    if returnedID == videoID {
+                        videoInfos.append(response)
+                    } else {
+                        print("YouTubeKit: \(client.rawValue) returned wrong videoID \(returnedID) (wanted \(videoID))")
+                    }
+                case .failure(let error):
+                    print("YouTubeKit: \(client.rawValue) failed: \(error)")
                     errors.append(error)
                 }
             }
