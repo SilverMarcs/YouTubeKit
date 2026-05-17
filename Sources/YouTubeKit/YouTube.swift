@@ -443,10 +443,10 @@ public class YouTube {
             let signatureTimestamp = try await signatureTimestamp
             let ytcfg = try await ytcfg
             
-            // Single client for speed — was [.androidVR, .webSafari, .web].
-            // androidVR returns the full AVC1 (H.264) format set. webSafari alone
-            // skips H.264 in favor of VP9/AV1, which AVPlayer can't decode well.
-            let innertubeClients: [InnerTube.ClientType] = [.androidVR]
+            // Kept all three clients (parallel) for full format coverage.
+            // Dropping to a single client misses 1080p AVC1 on some videos —
+            // the latency win wasn't worth the quality regression.
+            let innertubeClients: [InnerTube.ClientType] = [.androidVR, .webSafari, .web]
             
             let results: [Result<InnerTube.VideoInfo, Error>] = await innertubeClients.concurrentMap { [videoID, useOAuth, allowOAuthCache] client in
                 let innertube = InnerTube(client: client, signatureTimestamp: signatureTimestamp, ytcfg: ytcfg, useOAuth: useOAuth, allowCache: allowOAuthCache)
