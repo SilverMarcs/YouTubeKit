@@ -17,10 +17,53 @@ public class YouTube {
 #if swift(>=5.10)
     nonisolated(unsafe) private static var __js: String? // caches js between calls
     nonisolated(unsafe) private static var __jsURL: URL?
+    nonisolated(unsafe) private static var __ytcfg: Extraction.YtCfg? // cached cross-instance
+    nonisolated(unsafe) private static var __signatureTimestamp: Int?
+    nonisolated(unsafe) private static var __diskLoaded = false
 #else
     private static var __js: String? // caches js between calls
     private static var __jsURL: URL?
+    private static var __ytcfg: Extraction.YtCfg?
+    private static var __signatureTimestamp: Int?
+    private static var __diskLoaded = false
 #endif
+
+    /// Global toggle. When true, YouTubeKit persists the player JS + ytcfg to disk
+    /// after the first extraction and skips re-fetching them on later launches.
+    /// On signature failure the persisted cache is invalidated and the slow path retries.
+    public static var useDiskCache: Bool = true
+
+    /// Per-instance flag. When true, skips the watchHTML fetch entirely on the warm path
+    /// (when `__js`, `__jsURL`, `__ytcfg`, `__signatureTimestamp` are all populated).
+    /// Set this on YouTube() instances when you already know the video is playable —
+    /// e.g. coming from a video card the user just clicked.
+    public var skipAvailabilityCheck: Bool = false
+
+    private static func loadDiskCacheIfNeeded() {
+        guard useDiskCache, !__diskLoaded else { return }
+        __diskLoaded = true
+        guard let snap = PersistedCache.load() else { return }
+        __js = snap.js
+        __jsURL = snap.jsURL
+        __ytcfg = snap.ytcfg
+        __signatureTimestamp = snap.signatureTimestamp
+    }
+
+    private static func saveDiskCache() {
+        guard useDiskCache,
+              let js = __js, let jsURL = __jsURL, let ytcfg = __ytcfg
+        else { return }
+        PersistedCache.save(.init(
+            jsURL: jsURL, js: js,
+            signatureTimestamp: __signatureTimestamp,
+            ytcfg: ytcfg, savedAt: Date()
+        ))
+    }
+
+    private static func invalidateAllCaches() {
+        __js = nil; __jsURL = nil; __ytcfg = nil; __signatureTimestamp = nil
+        PersistedCache.invalidate()
+    }
     
     private var _videoInfos: [InnerTube.VideoInfo]?
     
@@ -69,7 +112,13 @@ public class YouTube {
     let allowOAuthCache: Bool
     
     let methods: [ExtractionMethod]
-    
+
+    /// Optional filter applied to raw stream formats before signature decryption.
+    /// Returning `true` keeps the format. Filtering early skips JavaScriptCore
+    /// signing work for streams you don't care about, which is the dominant
+    /// per-video cost. Set this before reading `streams`.
+    public var itagFilter: (@Sendable (Int) -> Bool)?
+
     private let log = OSLog(YouTube.self)
     
     /// - parameter methods: Methods used to extract streams from the video - ordered by priority (Default: `local` on iOS, macOS, tvOS, visionOS; `remote` on watchOS)
@@ -187,9 +236,17 @@ public class YouTube {
             if let cached = _js {
                 return cached
             }
-            
+
+            YouTube.loadDiskCacheIfNeeded()
+
+            // Fast path: trust persisted js without re-fetching watchHTML.
+            if skipAvailabilityCheck, let staticJS = YouTube.__js {
+                _js = staticJS
+                return staticJS
+            }
+
             let jsURL = try await jsURL
-            
+
             if YouTube.__jsURL != jsURL {
                 let (data, _) = try await URLSession.shared.data(from: jsURL)
                 _js = String(data: data, encoding: .utf8) ?? ""
@@ -207,19 +264,33 @@ public class YouTube {
             if let cached = _signatureTimestamp {
                 return cached
             }
-            
+
+            YouTube.loadDiskCacheIfNeeded()
+            if skipAvailabilityCheck, let cached = YouTube.__signatureTimestamp {
+                _signatureTimestamp = cached
+                return cached
+            }
+
             _signatureTimestamp = try await Extraction.extractSignatureTimestamp(fromJS: js)
+            YouTube.__signatureTimestamp = _signatureTimestamp
             return _signatureTimestamp
         }
     }
-    
+
     var ytcfg: Extraction.YtCfg {
         get async throws {
             if let cached = _ytcfg {
                 return cached
             }
-            
+
+            YouTube.loadDiskCacheIfNeeded()
+            if skipAvailabilityCheck, let cached = YouTube.__ytcfg {
+                _ytcfg = cached
+                return cached
+            }
+
             _ytcfg = try await Extraction.extractYtCfg(from: watchHTML)
+            YouTube.__ytcfg = _ytcfg
             return _ytcfg!
         }
     }
@@ -229,7 +300,9 @@ public class YouTube {
     /// If the streams have not been initialized, finds all relevant streams and initializes them.
     public var streams: [Stream] {
         get async throws {
-            try await checkAvailability()
+            if !skipAvailabilityCheck {
+                try await checkAvailability()
+            }
             if let cached = _fmtStreams {
                 return cached
             }
@@ -245,17 +318,28 @@ public class YouTube {
                     var existingITags = Set<Int>()
                     
                     func process(streamingData: InnerTube.StreamingData, videoInfo: InnerTube.VideoInfo) async throws {
-                        
+
                         var streamManifest = Extraction.applyDescrambler(streamData: streamingData)
-                        
+
+                        // Narrow the manifest before signing — large win for cold-extract latency.
+                        if let filter = self.itagFilter {
+                            streamManifest = streamManifest.filter { filter($0.itag) }
+                        }
+
                         do {
                             try await Extraction.applySignature(streamManifest: &streamManifest, videoInfo: videoInfo, js: js)
                         } catch {
-                            // to force an update to the js file, we clear the cache and retry
+                            // Signature failed — base.js probably rotated. Wipe both static
+                            // and persisted caches, fall back to the full pipeline, and retry.
                             _js = nil
                             _jsURL = nil
-                            YouTube.__js = nil
-                            YouTube.__jsURL = nil
+                            _ytcfg = nil
+                            _signatureTimestamp = nil
+                            YouTube.invalidateAllCaches()
+                            // Force re-fetch on the slow path even if we were skipping availability.
+                            let previousSkip = self.skipAvailabilityCheck
+                            self.skipAvailabilityCheck = false
+                            defer { self.skipAvailabilityCheck = previousSkip }
                             try await Extraction.applySignature(streamManifest: &streamManifest, videoInfo: videoInfo, js: js)
                         }
                         
@@ -283,7 +367,11 @@ public class YouTube {
                             try await process(streamingData: streamingData, videoInfo: videoInfo)
                         }
                     }
-                    
+
+                    // Streams extracted successfully — persist the player JS + ytcfg
+                    // so the next launch can skip watchHTML entirely.
+                    YouTube.saveDiskCache()
+
                     return streams
 #endif
                     
@@ -355,7 +443,10 @@ public class YouTube {
             let signatureTimestamp = try await signatureTimestamp
             let ytcfg = try await ytcfg
             
-            let innertubeClients: [InnerTube.ClientType] = [.androidVR, .webSafari, .web]
+            // Single client for speed — was [.androidVR, .webSafari, .web].
+            // androidVR returns the full AVC1 (H.264) format set. webSafari alone
+            // skips H.264 in favor of VP9/AV1, which AVPlayer can't decode well.
+            let innertubeClients: [InnerTube.ClientType] = [.androidVR]
             
             let results: [Result<InnerTube.VideoInfo, Error>] = await innertubeClients.concurrentMap { [videoID, useOAuth, allowOAuthCache] client in
                 let innertube = InnerTube(client: client, signatureTimestamp: signatureTimestamp, ytcfg: ytcfg, useOAuth: useOAuth, allowCache: allowOAuthCache)

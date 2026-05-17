@@ -152,24 +152,24 @@ class Extraction {
         return nil
     }
     
-    struct YtCfg: Decodable {
+    struct YtCfg: Codable {
         let VISITOR_DATA: String?
         let INNERTUBE_CONTEXT: Context?
         let WEB_PLAYER_CONTEXT_CONFIGS: WebPlayerContextConfigs?
-        
-        struct Context: Decodable {
+
+        struct Context: Codable {
             let client: Client
-            
-            struct Client: Decodable {
+
+            struct Client: Codable {
                 let visitorData: String?
                 let userAgent: String?
             }
         }
 
-        struct WebPlayerContextConfigs: Decodable {
+        struct WebPlayerContextConfigs: Codable {
             let WEB_PLAYER_CONTEXT_CONFIG_ID_EMBEDDED_PLAYER: EmbeddedPlayer?
 
-            struct EmbeddedPlayer: Decodable {
+            struct EmbeddedPlayer: Codable {
                 let encryptedHostFlags: String?
             }
         }
