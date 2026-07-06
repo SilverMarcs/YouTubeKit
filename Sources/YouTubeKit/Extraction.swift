@@ -392,10 +392,34 @@ class Extraction {
     }
     
 #if canImport(JavaScriptCore)
+    // Cache the SignatureSolver across calls. Building one compiles the
+    // meriyah + astring + yt_ejs JS bundles in JavaScriptCore (~2s) and depends
+    // only on the player JS, so it's reused for every video sharing that base.js.
+    // Previously a fresh solver was built per applySignature call — and that's
+    // called once per InnerTube client, so a single short paid the ~2s setup 3×.
+    // The lock serialises JSContext access, which isn't safe across the
+    // concurrent extractions the app runs.
+    private static let solverCacheLock = NSLock()
+#if swift(>=5.10)
+    nonisolated(unsafe) private static var _cachedSolver: SignatureSolver?
+    nonisolated(unsafe) private static var _cachedSolverJS: String?
+#else
+    private static var _cachedSolver: SignatureSolver?
+    private static var _cachedSolverJS: String?
+#endif
+
+    /// Returns a cached solver for `js`, building and caching one on a miss.
+    /// Caller MUST hold `solverCacheLock`.
+    private static func cachedSolver(js: String) throws -> SignatureSolver {
+        if let solver = _cachedSolver, _cachedSolverJS == js { return solver }
+        let solver = try SignatureSolver(js: js)
+        _cachedSolver = solver
+        _cachedSolverJS = js
+        return solver
+    }
+
     /// apply the decrypted signature to the stream manifest
     class func applySignature(streamManifest: inout [InnerTube.StreamingData.Format], videoInfo: InnerTube.VideoInfo, js: String) throws {
-        let solver = try SignatureSolver(js: js)
-
         var sigInputs: [String] = []
         var nInputs: [String] = []
 
@@ -418,9 +442,15 @@ class Extraction {
             }
         }
 
-        // Batch solve all signatures and n-parameters
+        // Batch solve all signatures and n-parameters, reusing the cached solver
+        // and serialising JSContext access.
         let request = SignatureSolver.SolveRequest(nInputs: nInputs, sigInputs: sigInputs)
-        let response = try solver.batchSolve(request: request)
+        let response: SignatureSolver.SolveResponse = try {
+            solverCacheLock.lock()
+            defer { solverCacheLock.unlock() }
+            let solver = try cachedSolver(js: js)
+            return try solver.batchSolve(request: request)
+        }()
 
         var invalidStreamIndices = [Int]()
 

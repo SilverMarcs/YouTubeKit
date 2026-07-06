@@ -147,6 +147,13 @@ class SignatureSolver {
         let sigMap: [String: String]
     }
     
+    /// Caches the parsed player ("preprocessed player") from the first solve.
+    /// The JS helper's `preprocessPlayer()` parses the ~2 MB base.js with meriyah
+    /// (~1.5s) and was re-run on every batchSolve; reusing the preprocessed form
+    /// makes every call after the first near-instant. Combined with caching the
+    /// solver instance itself, only the first solve per session pays the parse.
+    private var preprocessedPlayer: String?
+
     func batchSolve(request: SolveRequest) throws -> SolveResponse {
 
         let requests = [
@@ -154,15 +161,31 @@ class SignatureSolver {
             Request(type: .sig, challenges: request.sigInputs)
         ]
 
-        let input = Input(
-            type: .player,
-            player: self.playerJS,
-            preprocessed_player: nil,
-            requests: requests,
-            output_preprocessed: false
-        )
+        let input: Input
+        if let preprocessed = preprocessedPlayer {
+            input = Input(
+                type: .preprocessedPlayer,
+                player: nil,
+                preprocessed_player: preprocessed,
+                requests: requests,
+                output_preprocessed: false
+            )
+        } else {
+            input = Input(
+                type: .player,
+                player: self.playerJS,
+                preprocessed_player: nil,
+                requests: requests,
+                output_preprocessed: true
+            )
+        }
 
         let response = try solve(with: input)
+
+        // Cache the preprocessed player returned by the first `.player` solve.
+        if preprocessedPlayer == nil, let preprocessed = response.preprocessed_player {
+            preprocessedPlayer = preprocessed
+        }
 
         var nMap: [String: String] = [:]
         var sigMap: [String: String] = [:]
