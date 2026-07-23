@@ -481,7 +481,10 @@ public class YouTube {
             //
             // Without `responseSatisfied` set, the first successful client wins —
             // matches the old "happy path" but pays only 1 round-trip on cache-warm runs.
-            let clientPriority: [InnerTube.ClientType] = [.androidVR, .web, .webSafari]
+            // .ios added 2026-07: YouTube bot-walled anonymous androidVR/web/webSafari
+            // player calls (LOGIN_REQUIRED "Sign in to confirm you're not a bot");
+            // the IOS client still returns the full plain-URL adaptive set.
+            let clientPriority: [InnerTube.ClientType] = [.androidVR, .ios, .web, .webSafari]
 
             var videoInfos = [InnerTube.VideoInfo]()
             var errors = [Error]()
